@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import json
 import datetime
+from uuid import uuid4
 
 import streamlit as st
 
@@ -26,6 +27,7 @@ else:
 # Dict that holds all analytics results. Note that this is persistent across users,
 # as modules are only imported once by a streamlit app.
 counts = {"loaded_from_firestore": False}
+counts_for_each = {}
 
 
 def reset_counts():
@@ -37,6 +39,7 @@ def reset_counts():
     counts["per_day"] = {"days": [str(yesterday)], "pageviews": [0], "script_runs": [0]}
     counts["widgets"] = {}
     counts["start_time"] = datetime.datetime.now().strftime("%d %b %Y, %H:%M:%S")
+    counts_for_each["widgets"] = {}
 
 
 reset_counts()
@@ -92,6 +95,13 @@ def _track_user(sess):
         counts["total_pageviews"] += 1
         counts["per_day"]["pageviews"][-1] += 1
         # print("Tracked new user")
+    # aggregate value per run
+    if 'session_uuid' not in st.session_state:
+        st.session_state.session_uuid = uuid4().urn
+    counts_for_each["session_uuid"] = st.session_state.session_uuid
+    counts_for_each["timestamp"] = str(now)
+    # reset widget for each run
+    counts_for_each["widgets"] = {}
 
 
 def _wrap_checkbox(func, state_dict):
@@ -102,8 +112,11 @@ def _wrap_checkbox(func, state_dict):
     def new_func(label, *args, **kwargs):
         checked = func(label, *args, **kwargs)
         label = replace_empty(label)
+        counts_for_each["widgets"][label] = 0
         if label not in counts["widgets"]:
             counts["widgets"][label] = 0
+        if checked:
+            counts_for_each["widgets"][label] = 1
         if checked != state_dict.get(label, None):
             counts["widgets"][label] += 1
         state_dict[label] = checked
@@ -120,10 +133,12 @@ def _wrap_button(func, state_dict):
     def new_func(label, *args, **kwargs):
         clicked = func(label, *args, **kwargs)
         label = replace_empty(label)
+        counts_for_each["widgets"][label] = 0
         if label not in counts["widgets"]:
             counts["widgets"][label] = 0
         if clicked:
             counts["widgets"][label] += 1
+            counts_for_each["widgets"][label] = 1
         state_dict[label] = clicked
         return clicked
 
@@ -138,12 +153,15 @@ def _wrap_file_uploader(func, state_dict):
     def new_func(label, *args, **kwargs):
         uploaded_file = func(label, *args, **kwargs)
         label = replace_empty(label)
+        counts_for_each["widgets"][label] = 0
         if label not in counts["widgets"]:
             counts["widgets"][label] = 0
         # TODO: Right now this doesn't track when multiple files are uploaded one after
         #   another. Maybe compare files directly (but probably not very clever to
         #   store in session state) or hash them somehow and check if a different file
         #   was uploaded.
+        if uploaded_file:
+            counts_for_each["widgets"][label] = 1
         if uploaded_file and not state_dict.get(label, None):
             counts["widgets"][label] += 1
         state_dict[label] = bool(uploaded_file)
@@ -162,12 +180,15 @@ def _wrap_select(func, state_dict):
         orig_selected = func(label, options, *args, **kwargs)
         label = replace_empty(label)
         selected = replace_empty(orig_selected)
+        counts_for_each["widgets"][label] = {}
         if label not in counts["widgets"]:
             counts["widgets"][label] = {}
         for option in options:
             option = replace_empty(option)
+            counts_for_each["widgets"][label][option] = 0
             if option not in counts["widgets"][label]:
                 counts["widgets"][label][option] = 0
+        counts_for_each["widgets"][label][selected] = 1
         if selected != state_dict.get(label, None):
             counts["widgets"][label][selected] += 1
         state_dict[label] = selected
@@ -185,14 +206,17 @@ def _wrap_multiselect(func, state_dict):
     def new_func(label, options, *args, **kwargs):
         selected = func(label, options, *args, **kwargs)
         label = replace_empty(label)
+        counts_for_each["widgets"][label] = {}
         if label not in counts["widgets"]:
             counts["widgets"][label] = {}
         for option in options:
             option = replace_empty(option)
+            counts_for_each["widgets"][label][option] = 0
             if option not in counts["widgets"][label]:
                 counts["widgets"][label][option] = 0
         for sel in selected:
             sel = replace_empty(sel)
+            counts_for_each["widgets"][label][sel] = 1
             if sel not in state_dict.get(label, []):
                 counts["widgets"][label][sel] += 1
         state_dict[label] = selected
@@ -210,6 +234,7 @@ def _wrap_value(func, state_dict):
 
     def new_func(label, *args, **kwargs):
         value = func(label, *args, **kwargs)
+        counts_for_each["widgets"][label] = {}
         if label not in counts["widgets"]:
             counts["widgets"][label] = {}
 
@@ -217,7 +242,7 @@ def _wrap_value(func, state_dict):
         if type(value) == tuple and len(value) == 2:
             # Double-ended slider or date input with start/end, convert to str.
             formatted_value = f"{value[0]} - {value[1]}"
-            
+
         # st.date_input and st.time return datetime object, convert to str
         if (
             isinstance(value, datetime.datetime)
@@ -226,6 +251,7 @@ def _wrap_value(func, state_dict):
         ):
             formatted_value = str(value)
 
+        counts_for_each["widgets"][label][formatted_value] = 1
         if formatted_value not in counts["widgets"][label]:
             counts["widgets"][label][formatted_value] = 0
         if formatted_value != state_dict.get(label, None):
@@ -261,7 +287,7 @@ def start_tracking(
 
     if load_from_json is not None:
         if verbose:
-            print(f"Loading counts from json:", load_from_json)
+            print("Loading counts from json:", load_from_json)
         try:
             with Path(load_from_json).open("r") as f:
                 json_counts = json.load(f)
@@ -272,9 +298,9 @@ def start_tracking(
                 print("Success! Loaded counts:")
                 print(counts)
                 print()
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             if verbose:
-                print(f"File not found, proceeding with empty counts.")
+                print("File not found, proceeding with empty counts.")
 
     sess = get_session_state(
         user_tracked=False,
@@ -359,6 +385,8 @@ def stop_tracking(
         print("Finished script execution. New counts:")
         print(counts)
         print("-" * 80)
+        print(counts_for_each)
+        print("-" * 80)
 
     # sess = get_session_state
     # print(sess.state_dict)
@@ -401,6 +429,7 @@ def stop_tracking(
         if verbose:
             print("Saving count data to firestore:")
             print(counts)
+            print(counts_for_each)
             print()
         firestore.save(counts, firestore_key_file, firestore_collection_name)
 
@@ -416,7 +445,7 @@ def stop_tracking(
     query_params = st.experimental_get_query_params()
     if "analytics" in query_params and "on" in query_params["analytics"]:
         st.write("---")
-        display.show_results(counts, reset_counts, unsafe_password)
+        display.show_results(counts, counts_for_each, reset_counts, unsafe_password)
 
 
 @contextmanager
